@@ -1,0 +1,10 @@
+# Secrets
+.env
+
+# Python caches
+__pycache__/
+*.pyc
+
+# Node modules and coverage (if you eventually move the Node app here)
+node_modules/
+coverage/

@@ -9,14 +9,15 @@ Options:
     --test-dir DIR      Where to write tests, relative to src-dir (default: tests)
     --coverage N        Minimum line-coverage % to consider a file done (default: 80)
     --retries N         Max AI fix attempts per file before giving up (default: 5)
-    --model MODEL       Gemini model to use (default: gemini-2.5-flash)
+    --model MODEL       Claude model to use (default: claude-sonnet-4-5)
     --extensions        Comma-separated extensions to process (default: .js,.ts)
 
 Environment:
-    GEMINI_API_KEY      Required — set in .env at project root or current directory
+    ANTHROPIC_API_KEY   Required — set in .env at project root or current directory
 
 Example:
     python generate_tests.py /path/to/my-node-app --src-dir app --coverage 85
+    python generate_tests.py /path/to/my-node-app --model claude-opus-4-5
 """
 
 import os
@@ -28,6 +29,7 @@ import argparse
 import subprocess
 import datetime
 from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
 # Tee — write to both stdout and a log file simultaneously
@@ -58,9 +60,9 @@ class Tee:
 # Optional deps — give a clear error if missing
 # ---------------------------------------------------------------------------
 try:
-    from google import genai
+    import anthropic
 except ImportError:
-    print("ERROR: 'google-genai' package not installed. Run: pip install google-genai")
+    print("ERROR: 'anthropic' package not installed. Run: pip install anthropic")
     sys.exit(1)
 
 try:
@@ -101,7 +103,7 @@ SRC_DIR_CANDIDATES: list[str] = ["src", "app", "lib", "server", "."]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Self-healing Jest test generator powered by Gemini AI",
+        description="Self-healing Jest test generator powered by Claude AI",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -133,8 +135,8 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.5-flash",
-        help="Gemini model name (default: gemini-2.5-flash)",
+        default="claude-sonnet-4-5",
+        help="Claude model name (default: claude-sonnet-4-5)",
     )
     parser.add_argument(
         "--extensions",
@@ -149,7 +151,7 @@ def parse_args() -> argparse.Namespace:
 # ---------------------------------------------------------------------------
 
 def load_api_key(project_dir: str) -> str:
-    """Load GEMINI_API_KEY from .env in project dir or cwd."""
+    """Load ANTHROPIC_API_KEY from .env in project dir or cwd."""
     # Try project dir first, then cwd
     for search_dir in [project_dir, os.getcwd()]:
         env_path = os.path.join(search_dir, ".env")
@@ -159,11 +161,11 @@ def load_api_key(project_dir: str) -> str:
     else:
         load_dotenv()  # fallback: search default locations
 
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
+    key = os.environ.get("ANTHROPIC_API_KEY", "").strip()
     if not key:
-        print("\nERROR: GEMINI_API_KEY is not set.")
+        print("\nERROR: ANTHROPIC_API_KEY is not set.")
         print("  • Create a .env file in your project root with:")
-        print("      GEMINI_API_KEY=your_key_here\n")
+        print("      ANTHROPIC_API_KEY=your_key_here\n")
         sys.exit(1)
     return key
 
@@ -216,23 +218,28 @@ def discover_source_files(src_dir: str, extensions: list[str]) -> list[str]:
 # AI Interaction
 # ---------------------------------------------------------------------------
 
-def call_gemini(client, model: str, prompt: str, api_retries: int = 3) -> str | None:
+def call_claude(client, model: str, prompt: str, api_retries: int = 3) -> str | None:
     """
-    Call the Gemini API and return clean JavaScript code.
+    Call the Claude API and return clean JavaScript code.
     Returns None if all retries fail.
     """
     for attempt in range(1, api_retries + 1):
         try:
-            print("    🤖 Calling Gemini AI...", flush=True)
-            response = client.models.generate_content(model=model, contents=prompt)
-            raw = response.text or ""
+            print("    🤖 Calling Claude AI...", flush=True)
+            message = client.messages.create(
+                model=model,
+                max_tokens=8096,
+                messages=[{"role": "user", "content": prompt}],
+            )
+            raw = message.content[0].text if message.content else ""
             return strip_markdown_fences(raw)
         except Exception as exc:
             print(f"    [API Error attempt {attempt}/{api_retries}]: {exc}")
             if attempt < api_retries:
-                print("    Waiting 10 s before retry...")
-                time.sleep(10)
-    print("    ❌ Gemini API unreachable after all retries.")
+                wait = 30 if "overloaded" in str(exc).lower() or "rate" in str(exc).lower() else 10
+                print(f"    Waiting {wait} s before retry...")
+                time.sleep(wait)
+    print("    ❌ Claude API unreachable after all retries.")
     return None
 
 
@@ -476,7 +483,7 @@ def process_file(
         print(f"\n  ─── Attempt {attempt}/{max_retries} ───────────────────────", flush=True)
 
         # ── Generate ──────────────────────────────────────────────────────
-        generated_tests = call_gemini(client, model, prompt)
+        generated_tests = call_claude(client, model, prompt)
         if generated_tests is None:
             print("  ❌ Skipping this attempt — AI call failed.")
             if attempt == max_retries:
@@ -513,7 +520,7 @@ def process_file(
             return False, coverage_pct
 
         # ── Build fix prompt and retry ────────────────────────────────────
-        print("  🔁 Sending error report back to Gemini for a fix...")
+        print("  🔁 Sending error report back to Claude for a fix...")
         _print_jest_output(terminal_output)
         prompt = build_fix_prompt(
             source_code, source_rel,
@@ -559,7 +566,7 @@ def main() -> None:
     sys.stdout = tee
 
     api_key = load_api_key(project_dir)
-    client = genai.Client(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key)
 
     # ── Resolve source directory ──────────────────────────────────────────
     if args.src_dir:
@@ -595,7 +602,7 @@ def main() -> None:
     print(f"  Coverage dir  : {coverage_out_dir}")
     print(f"  Min coverage  : {target_coverage:.0f}%")
     print(f"  Max retries   : {max_retries}")
-    print(f"  Gemini model  : {model}")
+    print(f"  Claude model  : {model}")
     print(f"  Extensions    : {', '.join(extensions)}")
     print("═" * 62)
 
@@ -681,6 +688,7 @@ def main() -> None:
     print()
 
     tee.close()
+
 
 def _coverage_bar(pct: float, width: int = 10) -> str:
     """Render a tiny ASCII progress bar, e.g. [████░░░░░░]"""

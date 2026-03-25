@@ -13,7 +13,7 @@ Options:
     --extensions        Comma-separated extensions to process (default: .js,.ts)
 
 Environment:
-    GEMINI_API_KEY      Required — set in .env at project root or current directory
+    GEMINI_API_KEY   Required — set in .env at project root or current directory
 
 Example:
     python generate_tests.py /path/to/my-node-app --src-dir app --coverage 85
@@ -28,6 +28,7 @@ import argparse
 import subprocess
 import datetime
 from pathlib import Path
+
 
 # ---------------------------------------------------------------------------
 # Tee — write to both stdout and a log file simultaneously
@@ -216,10 +217,16 @@ def discover_source_files(src_dir: str, extensions: list[str]) -> list[str]:
 # AI Interaction
 # ---------------------------------------------------------------------------
 
+class QuotaExhaustedError(Exception):
+    """Raised when Gemini returns a 429 / RESOURCE_EXHAUSTED error."""
+    pass
+
+
 def call_gemini(client, model: str, prompt: str, api_retries: int = 3) -> str | None:
     """
     Call the Gemini API and return clean JavaScript code.
-    Returns None if all retries fail.
+    Raises QuotaExhaustedError immediately on 429 / RESOURCE_EXHAUSTED — no retry.
+    Returns None if all other retries fail.
     """
     for attempt in range(1, api_retries + 1):
         try:
@@ -228,6 +235,14 @@ def call_gemini(client, model: str, prompt: str, api_retries: int = 3) -> str | 
             raw = response.text or ""
             return strip_markdown_fences(raw)
         except Exception as exc:
+            exc_str = str(exc)
+            # 429 / RESOURCE_EXHAUSTED means the free quota is gone — stop everything
+            if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str.upper() or "resource exhausted" in exc_str.lower():
+                raise QuotaExhaustedError(
+                    f"Gemini quota exhausted (429 RESOURCE_EXHAUSTED).\n"
+                    f"  Original error: {exc}\n"
+                    f"  Wait for your quota to reset (usually 24 h) or upgrade your plan."
+                )
             print(f"    [API Error attempt {attempt}/{api_retries}]: {exc}")
             if attempt < api_retries:
                 print("    Waiting 10 s before retry...")
@@ -476,7 +491,10 @@ def process_file(
         print(f"\n  ─── Attempt {attempt}/{max_retries} ───────────────────────", flush=True)
 
         # ── Generate ──────────────────────────────────────────────────────
-        generated_tests = call_gemini(client, model, prompt)
+        try:
+            generated_tests = call_gemini(client, model, prompt)
+        except QuotaExhaustedError:
+            raise   # bubble up to main() — stop the entire run
         if generated_tests is None:
             print("  ❌ Skipping this attempt — AI call failed.")
             if attempt == max_retries:
@@ -629,23 +647,37 @@ def main() -> None:
         print(f"  📄  [{idx}/{len(src_files)}]  {rel}")
         print("═" * 62)
 
-        success, coverage_pct = process_file(
-            src_file     = src_file,
-            project_dir  = project_dir,
-            src_dir      = src_dir,
-            test_dir     = test_dir,
-            coverage_out_dir = coverage_out_dir,
-            client       = client,
-            model        = model,
-            target_coverage = target_coverage,
-            max_retries  = max_retries,
-        )
+        try:
+            success, coverage_pct = process_file(
+                src_file     = src_file,
+                project_dir  = project_dir,
+                src_dir      = src_dir,
+                test_dir     = test_dir,
+                coverage_out_dir = coverage_out_dir,
+                client       = client,
+                model        = model,
+                target_coverage = target_coverage,
+                max_retries  = max_retries,
+            )
+        except QuotaExhaustedError as qe:
+            print()
+            print("🚫  " + "═" * 58)
+            print("🚫  QUOTA EXHAUSTED — stopping all further API calls")
+            print("🚫  " + "═" * 58)
+            print(f"\n  {qe}\n")
+            results[rel] = {"success": False, "coverage": 0.0}
+            # Mark all remaining files as skipped
+            for remaining in src_files[idx:]:
+                rem_rel = os.path.relpath(remaining, project_dir)
+                results[rem_rel] = {"success": False, "coverage": -1.0}
+            break   # exit the file loop and fall through to summary
 
         results[rel] = {"success": success, "coverage": coverage_pct}
 
     # ── Final summary ─────────────────────────────────────────────────────
-    passed_files = [(f, r) for f, r in results.items() if r["success"]]
-    failed_files = [(f, r) for f, r in results.items() if not r["success"]]
+    passed_files  = [(f, r) for f, r in results.items() if r["success"]]
+    skipped_files = [(f, r) for f, r in results.items() if not r["success"] and r["coverage"] < 0]
+    failed_files  = [(f, r) for f, r in results.items() if not r["success"] and r["coverage"] >= 0]
 
     total_coverage = (
         sum(r["coverage"] for r in results.values()) / len(results)
@@ -659,6 +691,8 @@ def main() -> None:
     print(f"  Total files processed : {len(results)}")
     print(f"  ✅  Passed            : {len(passed_files)}")
     print(f"  ❌  Need manual review: {len(failed_files)}")
+    if skipped_files:
+        print(f"  ⏭️   Skipped (quota)   : {len(skipped_files)}")
     print(f"  📈  Avg line coverage : {total_coverage:.1f}%")
     print()
 
@@ -675,12 +709,19 @@ def main() -> None:
             bar = _coverage_bar(r["coverage"])
             print(f"       {bar}  {r['coverage']:5.1f}%  {f}")
 
+    if skipped_files:
+        print()
+        print("  ⏭️   Skipped due to quota exhaustion (re-run when quota resets):")
+        for f, r in skipped_files:
+            print(f"       [──────────]    n/a  {f}")
+
     print()
     print("═" * 62)
     print(f"  📋  Full log saved to: {log_path}")
     print()
 
     tee.close()
+
 
 def _coverage_bar(pct: float, width: int = 10) -> str:
     """Render a tiny ASCII progress bar, e.g. [████░░░░░░]"""

@@ -13,7 +13,7 @@ Options:
     --extensions        Comma-separated extensions to process (default: .js,.ts)
 
 Environment:
-    GEMINI_API_KEY   Required — set in .env at project root or current directory
+    No API key required — Ollama runs fully locally!
 
 Example:
     python generate_tests.py /path/to/my-node-app --src-dir app --coverage 85
@@ -59,16 +59,12 @@ class Tee:
 # Optional deps — give a clear error if missing
 # ---------------------------------------------------------------------------
 try:
-    from google import genai
+    import requests
 except ImportError:
-    print("ERROR: 'google-genai' package not installed. Run: pip install google-genai")
+    print("ERROR: 'requests' package not installed. Run: pip install requests")
     sys.exit(1)
 
-try:
-    from dotenv import load_dotenv
-except ImportError:
-    print("ERROR: 'python-dotenv' package not installed. Run: pip install python-dotenv")
-    sys.exit(1)
+
 
 
 # ---------------------------------------------------------------------------
@@ -102,7 +98,7 @@ SRC_DIR_CANDIDATES: list[str] = ["src", "app", "lib", "server", "."]
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Self-healing Jest test generator powered by Gemini AI",
+        description="Self-healing Jest test generator powered by Ollama (local)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
@@ -134,8 +130,13 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--model",
-        default="gemini-2.5-flash",
-        help="Gemini model name (default: gemini-2.5-flash)",
+        default="qwen2.5-coder:14b",
+        help="Ollama model name (default: qwen2.5-coder:14b)",
+    )
+    parser.add_argument(
+        "--ollama-url",
+        default="http://localhost:11434",
+        help="Ollama base URL (default: http://localhost:11434)",
     )
     parser.add_argument(
         "--extensions",
@@ -149,24 +150,28 @@ def parse_args() -> argparse.Namespace:
 # Setup
 # ---------------------------------------------------------------------------
 
-def load_api_key(project_dir: str) -> str:
-    """Load GEMINI_API_KEY from .env in project dir or cwd."""
-    # Try project dir first, then cwd
-    for search_dir in [project_dir, os.getcwd()]:
-        env_path = os.path.join(search_dir, ".env")
-        if os.path.exists(env_path):
-            load_dotenv(env_path)
-            break
-    else:
-        load_dotenv()  # fallback: search default locations
-
-    key = os.environ.get("GEMINI_API_KEY", "").strip()
-    if not key:
-        print("\nERROR: GEMINI_API_KEY is not set.")
-        print("  • Create a .env file in your project root with:")
-        print("      GEMINI_API_KEY=your_key_here\n")
+def check_ollama_running(ollama_url: str, model: str) -> None:
+    """Verify Ollama is running and the requested model is available."""
+    try:
+        resp = requests.get(f"{ollama_url}/api/tags", timeout=5)
+        resp.raise_for_status()
+        available = [m["name"] for m in resp.json().get("models", [])]
+        # Normalize: ollama tags may include ":latest" suffix
+        available_base = [m.split(":")[0] for m in available]
+        model_base = model.split(":")[0]
+        if model not in available and model_base not in available_base:
+            print(f"\nERROR: Model '{model}' is not pulled in Ollama.")
+            print(f"  Available models: {available or '(none)'}")
+            print(f"  Run: ollama pull {model}\n")
+            sys.exit(1)
+    except requests.exceptions.ConnectionError:
+        print(f"\nERROR: Ollama is not running at {ollama_url}")
+        print("  Start it with: ollama serve")
+        print("  Or download from: https://ollama.com\n")
         sys.exit(1)
-    return key
+    except Exception as exc:
+        print(f"\nERROR: Could not reach Ollama: {exc}\n")
+        sys.exit(1)
 
 
 def auto_detect_src_dir(project_dir: str) -> str:
@@ -217,37 +222,39 @@ def discover_source_files(src_dir: str, extensions: list[str]) -> list[str]:
 # AI Interaction
 # ---------------------------------------------------------------------------
 
-class QuotaExhaustedError(Exception):
-    """Raised when Gemini returns a 429 / RESOURCE_EXHAUSTED error."""
-    pass
-
-
-def call_gemini(client, model: str, prompt: str, api_retries: int = 3) -> str | None:
+def call_ollama(ollama_url: str, model: str, prompt: str, api_retries: int = 3) -> str | None:
     """
-    Call the Gemini API and return clean JavaScript code.
-    Raises QuotaExhaustedError immediately on 429 / RESOURCE_EXHAUSTED — no retry.
-    Returns None if all other retries fail.
+    Call the local Ollama API and return clean JavaScript code.
+    No rate limits, no quota — runs fully on your machine.
+    Returns None if all retries fail (e.g. Ollama crashed mid-run).
     """
+    endpoint = f"{ollama_url}/api/generate"
+    payload = {
+        "model": model,
+        "prompt": prompt,
+        "stream": False,
+        "options": {
+            "temperature": 0.2,      # low temp = more deterministic code
+            "num_predict": 8192,     # max tokens to generate
+        }
+    }
     for attempt in range(1, api_retries + 1):
         try:
-            print("    🤖 Calling Gemini AI...", flush=True)
-            response = client.models.generate_content(model=model, contents=prompt)
-            raw = response.text or ""
+            print(f"    🤖 Calling Ollama ({model})...", flush=True)
+            resp = requests.post(endpoint, json=payload, timeout=300)  # 5 min timeout
+            resp.raise_for_status()
+            raw = resp.json().get("response", "")
             return strip_markdown_fences(raw)
+        except requests.exceptions.Timeout:
+            print(f"    [Timeout on attempt {attempt}/{api_retries}] — model is taking too long")
+        except requests.exceptions.ConnectionError:
+            print(f"    [Connection error on attempt {attempt}/{api_retries}] — is Ollama still running?")
         except Exception as exc:
-            exc_str = str(exc)
-            # 429 / RESOURCE_EXHAUSTED means the free quota is gone — stop everything
-            if "429" in exc_str or "RESOURCE_EXHAUSTED" in exc_str.upper() or "resource exhausted" in exc_str.lower():
-                raise QuotaExhaustedError(
-                    f"Gemini quota exhausted (429 RESOURCE_EXHAUSTED).\n"
-                    f"  Original error: {exc}\n"
-                    f"  Wait for your quota to reset (usually 24 h) or upgrade your plan."
-                )
-            print(f"    [API Error attempt {attempt}/{api_retries}]: {exc}")
-            if attempt < api_retries:
-                print("    Waiting 10 s before retry...")
-                time.sleep(10)
-    print("    ❌ Gemini API unreachable after all retries.")
+            print(f"    [Error on attempt {attempt}/{api_retries}]: {exc}")
+        if attempt < api_retries:
+            print("    Waiting 5 s before retry...")
+            time.sleep(5)
+    print("    ❌ Ollama unreachable after all retries.")
     return None
 
 
@@ -453,7 +460,7 @@ def process_file(
     src_dir: str,
     test_dir: str,
     coverage_out_dir: str,
-    client,
+    ollama_url: str,
     model: str,
     target_coverage: float,
     max_retries: int,
@@ -491,10 +498,7 @@ def process_file(
         print(f"\n  ─── Attempt {attempt}/{max_retries} ───────────────────────", flush=True)
 
         # ── Generate ──────────────────────────────────────────────────────
-        try:
-            generated_tests = call_gemini(client, model, prompt)
-        except QuotaExhaustedError:
-            raise   # bubble up to main() — stop the entire run
+        generated_tests = call_ollama(ollama_url, model, prompt)
         if generated_tests is None:
             print("  ❌ Skipping this attempt — AI call failed.")
             if attempt == max_retries:
@@ -531,7 +535,7 @@ def process_file(
             return False, coverage_pct
 
         # ── Build fix prompt and retry ────────────────────────────────────
-        print("  🔁 Sending error report back to Gemini for a fix...")
+        print("  🔁 Sending error report back to Ollama for a fix...")
         _print_jest_output(terminal_output)
         prompt = build_fix_prompt(
             source_code, source_rel,
@@ -576,8 +580,8 @@ def main() -> None:
     tee = Tee(log_path)
     sys.stdout = tee
 
-    api_key = load_api_key(project_dir)
-    client = genai.Client(api_key=api_key)
+    ollama_url = args.ollama_url.rstrip("/")
+    check_ollama_running(ollama_url, args.model)
 
     # ── Resolve source directory ──────────────────────────────────────────
     if args.src_dir:
@@ -596,6 +600,7 @@ def main() -> None:
     target_coverage = args.coverage
     max_retries    = args.retries
     model          = args.model
+    ollama_url     = args.ollama_url.rstrip("/")
     extensions     = [e.strip() for e in args.extensions.split(",")]
     coverage_out_dir = "coverage"   # always inside project_dir; Jest default
 
@@ -613,7 +618,7 @@ def main() -> None:
     print(f"  Coverage dir  : {coverage_out_dir}")
     print(f"  Min coverage  : {target_coverage:.0f}%")
     print(f"  Max retries   : {max_retries}")
-    print(f"  Gemini model  : {model}")
+    print(f"  Ollama model  : {model}")
     print(f"  Extensions    : {', '.join(extensions)}")
     print("═" * 62)
 
@@ -647,37 +652,23 @@ def main() -> None:
         print(f"  📄  [{idx}/{len(src_files)}]  {rel}")
         print("═" * 62)
 
-        try:
-            success, coverage_pct = process_file(
-                src_file     = src_file,
-                project_dir  = project_dir,
-                src_dir      = src_dir,
-                test_dir     = test_dir,
-                coverage_out_dir = coverage_out_dir,
-                client       = client,
-                model        = model,
-                target_coverage = target_coverage,
-                max_retries  = max_retries,
-            )
-        except QuotaExhaustedError as qe:
-            print()
-            print("🚫  " + "═" * 58)
-            print("🚫  QUOTA EXHAUSTED — stopping all further API calls")
-            print("🚫  " + "═" * 58)
-            print(f"\n  {qe}\n")
-            results[rel] = {"success": False, "coverage": 0.0}
-            # Mark all remaining files as skipped
-            for remaining in src_files[idx:]:
-                rem_rel = os.path.relpath(remaining, project_dir)
-                results[rem_rel] = {"success": False, "coverage": -1.0}
-            break   # exit the file loop and fall through to summary
+        success, coverage_pct = process_file(
+            src_file     = src_file,
+            project_dir  = project_dir,
+            src_dir      = src_dir,
+            test_dir     = test_dir,
+            coverage_out_dir = coverage_out_dir,
+            ollama_url   = ollama_url,
+            model        = model,
+            target_coverage = target_coverage,
+            max_retries  = max_retries,
+        )
 
         results[rel] = {"success": success, "coverage": coverage_pct}
 
     # ── Final summary ─────────────────────────────────────────────────────
-    passed_files  = [(f, r) for f, r in results.items() if r["success"]]
-    skipped_files = [(f, r) for f, r in results.items() if not r["success"] and r["coverage"] < 0]
-    failed_files  = [(f, r) for f, r in results.items() if not r["success"] and r["coverage"] >= 0]
+    passed_files = [(f, r) for f, r in results.items() if r["success"]]
+    failed_files = [(f, r) for f, r in results.items() if not r["success"]]
 
     total_coverage = (
         sum(r["coverage"] for r in results.values()) / len(results)
@@ -691,8 +682,7 @@ def main() -> None:
     print(f"  Total files processed : {len(results)}")
     print(f"  ✅  Passed            : {len(passed_files)}")
     print(f"  ❌  Need manual review: {len(failed_files)}")
-    if skipped_files:
-        print(f"  ⏭️   Skipped (quota)   : {len(skipped_files)}")
+
     print(f"  📈  Avg line coverage : {total_coverage:.1f}%")
     print()
 
@@ -709,11 +699,7 @@ def main() -> None:
             bar = _coverage_bar(r["coverage"])
             print(f"       {bar}  {r['coverage']:5.1f}%  {f}")
 
-    if skipped_files:
-        print()
-        print("  ⏭️   Skipped due to quota exhaustion (re-run when quota resets):")
-        for f, r in skipped_files:
-            print(f"       [──────────]    n/a  {f}")
+
 
     print()
     print("═" * 62)
